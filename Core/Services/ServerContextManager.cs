@@ -1,1 +1,38 @@
-using System.IO; using BlueArchiveLauncher.Core.Models;  namespace BlueArchiveLauncher.Core.Services;  public sealed class ServerContextManager {     private readonly IReadOnlyDictionary<ServerId, ServerDefinition> _definitions =         new Dictionary<ServerId, ServerDefinition>         {             [ServerId.Global] = new(ServerId.Global, "GLOBAL", "Global", "国际服", "Kivo Wiki", "Global"),             [ServerId.CN] = new(ServerId.CN, "CN", "CN", "国服", "Kivo Wiki", "CN"),             [ServerId.JP] = new(ServerId.JP, "JP", "JP", "日服", "Kivo Wiki", "JP")         };      public ServerContext GetContext(ServerId serverId)     {         var definition = _definitions[serverId];         var root = Path.Combine(             Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),             "BlueArchiveLauncher",             "servers",             serverId.ToString());          Directory.CreateDirectory(root);         return new ServerContext(             definition,             root,             Path.Combine(root, "cache"),             Path.Combine(root, "launcher.log"));     } }  public sealed record ServerContext(     ServerDefinition Definition,     string RootDirectory,     string CacheDirectory,     string LogPath);
+using System.IO;
+using BlueArchiveLauncher.Core.Models;
+
+namespace BlueArchiveLauncher.Core.Services;
+
+public sealed class ServerContextManager
+{
+    private readonly IReadOnlyDictionary<ServerId, ServerDefinition> _definitions =
+        new Dictionary<ServerId, ServerDefinition>
+        {
+            [ServerId.Global] = new(ServerId.Global, "GLOBAL", "Global", "国际服", "Kivo Wiki", "Global"),
+            [ServerId.CN] = new(ServerId.CN, "CN", "CN", "国服", "Kivo Wiki", "CN"),
+            [ServerId.JP] = new(ServerId.JP, "JP", "JP", "日服", "Kivo Wiki", "JP")
+        };
+
+    public ServerContext GetContext(ServerId serverId)
+    {
+        var definition = _definitions[serverId];
+        var root = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "BlueArchiveLauncher",
+            "servers",
+            serverId.ToString());
+
+        Directory.CreateDirectory(root);
+        return new ServerContext(
+            definition,
+            root,
+            Path.Combine(root, "cache"),
+            Path.Combine(root, "launcher.log"));
+    }
+}
+
+public sealed record ServerContext(
+    ServerDefinition Definition,
+    string RootDirectory,
+    string CacheDirectory,
+    string LogPath);
