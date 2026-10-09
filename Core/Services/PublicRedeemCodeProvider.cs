@@ -1,1 +1,96 @@
-using System.Net.Http; using System.Net.Http.Headers; using System.Text.RegularExpressions; using BlueArchiveLauncher.Core.Models;  namespace BlueArchiveLauncher.Core.Services;  public sealed class PublicRedeemCodeProvider {     private const string SourceUrl = "https://www.eurogamer.net/blue-archive-codes";     private static readonly Regex LatestSectionPattern = new(         @"<h2[^>]*id\s*=\s*[""']working[""'][^>]*>.*?</h2>(?<section>.*?)(?:</ul>|<h2)",         RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.Singleline | RegexOptions.CultureInvariant);     private static readonly Regex CodePattern = new(         @"<li[^>]*>\s*<strong[^>]*>(?<code>[A-Z][A-Z0-9-]{5,24})</strong>\s*:\s*(?<reward>.*?)</li>",         RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.Singleline | RegexOptions.CultureInvariant);     private static readonly Regex TagPattern = new(         @"<[^>]+>",         RegexOptions.Compiled | RegexOptions.Singleline | RegexOptions.CultureInvariant);      private readonly FileLogger _logger;     private readonly HttpClient _httpClient;      public PublicRedeemCodeProvider(FileLogger logger, HttpClient httpClient)     {         _logger = logger;         _httpClient = httpClient;          if (!_httpClient.DefaultRequestHeaders.UserAgent.Any())         {             _httpClient.DefaultRequestHeaders.UserAgent.Add(                 new ProductInfoHeaderValue("BlueArchiveLauncher", "0.1"));         }     }      public async Task<IReadOnlyList<RedeemCodeInfo>> GetAsync(         ServerId serverId,         CancellationToken cancellationToken)     {         if (serverId != ServerId.Global)         {             _logger.Info($"No verified public redeem-code source configured for {serverId}; leaving codes empty.");             return Array.Empty<RedeemCodeInfo>();         }          try         {             using var response = await _httpClient.GetAsync(SourceUrl, cancellationToken);             response.EnsureSuccessStatusCode();             var html = await response.Content.ReadAsStringAsync(cancellationToken);             var section = LatestSectionPattern.Match(html).Groups["section"].Value;             if (string.IsNullOrWhiteSpace(section))             {                 _logger.Warn("Public redeem-code page did not contain a latest-code section.");                 return Array.Empty<RedeemCodeInfo>();             }              const string status = "第三方汇总 · 需在国际服官方入口核验";             var expiry = "公开汇总未标注到期日";             var codes = CodePattern.Matches(section)                 .Select(match => new RedeemCodeInfo(                     "Eurogamer 公开兑换码",                     match.Groups["code"].Value.Trim().ToUpperInvariant(),                     expiry,                     status)                 {                     Reward = CleanText(match.Groups["reward"].Value),                     SourceUrl = SourceUrl                 })                 .DistinctBy(code => code.Value, StringComparer.OrdinalIgnoreCase)                 .ToArray();                          _logger.Info($"获取到 {codes.Length} 条公开兑换码（{serverId}）");             return codes;         }         catch (OperationCanceledException)         {             throw;         }         catch (Exception ex)         {             _logger.Warn($"Public redeem-code source unavailable: {ex.Message}");             return Array.Empty<RedeemCodeInfo>();         }     }      private static string CleanText(string value)     {         var decoded = System.Net.WebUtility.HtmlDecode(TagPattern.Replace(value, " "));         return string.Join(             " ",             decoded.Split(                 new[] { ' ', '\r', '\n', '\t' },                 StringSplitOptions.RemoveEmptyEntries));     } }
+﻿using System.Net.Http;
+using System.Net.Http.Headers;
+using System.Text.RegularExpressions;
+using BlueArchiveLauncher.Core.Models;
+
+namespace BlueArchiveLauncher.Core.Services;
+
+public sealed class PublicRedeemCodeProvider
+{
+    private const string SourceUrl = "https://www.eurogamer.net/blue-archive-codes";
+    private static readonly Regex LatestSectionPattern = new(
+        @"<h2[^>]*id\s*=\s*[""']working[""'][^>]*>.*?</h2>(?<section>.*?)(?:</ul>|<h2)",
+        RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.Singleline | RegexOptions.CultureInvariant);
+    private static readonly Regex CodePattern = new(
+        @"<li[^>]*>\s*<strong[^>]*>(?<code>[A-Z][A-Z0-9-]{5,24})</strong>\s*:\s*(?<reward>.*?)</li>",
+        RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.Singleline | RegexOptions.CultureInvariant);
+    private static readonly Regex TagPattern = new(
+        @"<[^>]+>",
+        RegexOptions.Compiled | RegexOptions.Singleline | RegexOptions.CultureInvariant);
+
+    private readonly FileLogger _logger;
+    private readonly HttpClient _httpClient;
+
+    public PublicRedeemCodeProvider(FileLogger logger, HttpClient httpClient)
+    {
+        _logger = logger;
+        _httpClient = httpClient;
+
+        if (!_httpClient.DefaultRequestHeaders.UserAgent.Any())
+        {
+            _httpClient.DefaultRequestHeaders.UserAgent.Add(
+                new ProductInfoHeaderValue("BlueArchiveLauncher", "0.1"));
+        }
+    }
+
+    public async Task<IReadOnlyList<RedeemCodeInfo>> GetAsync(
+        ServerId serverId,
+        CancellationToken cancellationToken)
+    {
+        if (serverId != ServerId.Global)
+        {
+            _logger.Info($"No verified public redeem-code source configured for {serverId}; leaving codes empty.");
+            return Array.Empty<RedeemCodeInfo>();
+        }
+
+        try
+        {
+            using var response = await _httpClient.GetAsync(SourceUrl, cancellationToken);
+            response.EnsureSuccessStatusCode();
+            var html = await response.Content.ReadAsStringAsync(cancellationToken);
+            var section = LatestSectionPattern.Match(html).Groups["section"].Value;
+            if (string.IsNullOrWhiteSpace(section))
+            {
+                _logger.Warn("Public redeem-code page did not contain a latest-code section.");
+                return Array.Empty<RedeemCodeInfo>();
+            }
+
+            const string status = "第三方汇总 · 需在国际服官方入口核验";
+            var expiry = "公开汇总未标注到期日";
+            var codes = CodePattern.Matches(section)
+                .Select(match => new RedeemCodeInfo(
+                    "Eurogamer 公开兑换码",
+                    match.Groups["code"].Value.Trim().ToUpperInvariant(),
+                    expiry,
+                    status)
+                {
+                    Reward = CleanText(match.Groups["reward"].Value),
+                    SourceUrl = SourceUrl
+                })
+                .DistinctBy(code => code.Value, StringComparer.OrdinalIgnoreCase)
+                .ToArray();
+            
+            _logger.Info($"获取到 {codes.Length} 条公开兑换码（{serverId}）");
+            return codes;
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _logger.Warn($"Public redeem-code source unavailable: {ex.Message}");
+            return Array.Empty<RedeemCodeInfo>();
+        }
+    }
+
+    private static string CleanText(string value)
+    {
+        var decoded = System.Net.WebUtility.HtmlDecode(TagPattern.Replace(value, " "));
+        return string.Join(
+            " ",
+            decoded.Split(
+                new[] { ' ', '\r', '\n', '\t' },
+                StringSplitOptions.RemoveEmptyEntries));
+    }
+}
