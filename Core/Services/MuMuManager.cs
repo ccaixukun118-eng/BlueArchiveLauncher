@@ -1,1 +1,837 @@
-using System.Diagnostics; using System.IO; using System.Net.Http; using Microsoft.Win32; using System.Runtime.InteropServices; using System.Text.Json;  namespace BlueArchiveLauncher.Core.Services;  public sealed class MuMuManager {     private const string DefaultVmIndex = "0";     private const string InstallerRedirectUrl = "https://api.mumuplayer.com/api/dl/win?channel=gw-win-download";      public event Action<MuMuInstallProgress>? InstallProgressChanged;      private readonly FileLogger _logger;      public MuMuManager(FileLogger logger)     {         _logger = logger;     }      public async Task<MuMuStatus> DetectAsync(CancellationToken cancellationToken)     {         cancellationToken.ThrowIfCancellationRequested();          var discovery = DiscoverInstallation();         if (discovery is null)         {             _logger.Warn("未找到已安装的 MuMu 模拟器。");             return CreateMissingInstallStatus();         }          return await ReadStatusAsync(discovery, cancellationToken);     }      public async Task<MuMuStatus> LaunchAndConnectAsync(CancellationToken cancellationToken)     {         cancellationToken.ThrowIfCancellationRequested();          var discovery = DiscoverInstallation();         if (discovery is null)         {             return await DownloadAndInstallAsync(cancellationToken);         }          var initialStatus = await ReadStatusAsync(discovery, cancellationToken);          if (!IsMuMuMainRunning())         {             try             {                 var launchTarget = string.IsNullOrWhiteSpace(discovery.ShortcutPath)                     ? discovery.TargetPath                     : discovery.ShortcutPath;                 _logger.Info($"启动 MuMu 主程序：{launchTarget}");                 Process.Start(new ProcessStartInfo                 {                     FileName = launchTarget,                     WorkingDirectory = discovery.WorkingDirectory,                     UseShellExecute = true                 });             }             catch (Exception ex)             {                 _logger.Error("启动 MuMu 桌面快捷方式失败", ex);                 return initialStatus with                 {                     Label = "启动失败",                     Detail = $"无法打开 MuMu 桌面快捷方式：{ex.Message}"                 };             }              var mainDeadline = DateTimeOffset.UtcNow.AddSeconds(12);             while (!IsMuMuMainRunning() && DateTimeOffset.UtcNow < mainDeadline)             {                 cancellationToken.ThrowIfCancellationRequested();                 await Task.Delay(TimeSpan.FromMilliseconds(500), cancellationToken);             }         }          if (string.IsNullOrWhiteSpace(discovery.CliPath))         {             _logger.Warn("已找到 MuMu 快捷方式，但没有找到 mumu-cli.exe。");             return (await ReadStatusAsync(discovery, cancellationToken)) with             {                 Detail = "已打开 MuMu 主程序，但没有找到 MuMu 控制程序，无法自动启动 0 号实例。"             };         }          var launchResult = await RunProcessAsync(             discovery.CliPath,             new[] { "control", "--vmindex", discovery.VmIndex, "launch" },             discovery.WorkingDirectory,             cancellationToken,             TimeSpan.FromSeconds(12));          if (launchResult.ExitCode != 0)         {             _logger.Warn($"MuMu 实例启动命令失败：{launchResult.CombinedOutput}");             return (await ReadStatusAsync(discovery, cancellationToken)) with             {                 Label = "启动失败",                 Detail = $"MuMu 0 号实例启动失败：{TrimOutput(launchResult.CombinedOutput)}"             };         }          _logger.Info($"已请求 MuMu 启动实例 {discovery.VmIndex}：{TrimOutput(launchResult.CombinedOutput)}");          var deadline = DateTimeOffset.UtcNow.AddSeconds(45);         while (DateTimeOffset.UtcNow < deadline)         {             cancellationToken.ThrowIfCancellationRequested();             var status = await ReadStatusAsync(discovery, cancellationToken);             if (status.IsAdbConnected)             {                 _logger.Info($"MuMu 实例已通过 ADB 连接：{status.Detail}");                 return status;             }              await Task.Delay(TimeSpan.FromSeconds(1), cancellationToken);         }          var finalStatus = await ReadStatusAsync(discovery, cancellationToken);         _logger.Warn($"MuMu 实例启动后仍未建立 ADB 连接：{finalStatus.Detail}");         return finalStatus with         {             Detail = $"{finalStatus.Detail} 等待 ADB 连接超时，请确认 MuMu 窗口和 0 号实例已经完成启动。"         };     }  private async Task<MuMuStatus> DownloadAndInstallAsync(CancellationToken cancellationToken)     {         _logger.Warn("未找到 MuMu，开始下载官方安装器。");         ReportProgress(new MuMuInstallProgress("下载中", "正在获取 MuMu 官方安装器..."));          string installerPath;         try         {             installerPath = await DownloadInstallerAsync(cancellationToken);         }         catch (OperationCanceledException)         {             throw;         }         catch (Exception ex)         {             _logger.Error("下载 MuMu 安装器失败", ex);             return CreateMissingInstallStatus() with             {                 Label = "下载失败",                 Detail = $"MuMu 官方安装器下载失败：{ex.Message}"             };         }          ReportProgress(new MuMuInstallProgress(             "等待安装",             "安装器已下载。请在弹出的 MuMu 窗口中完成安装，完成后会自动连接。"));          Process? installer;         try         {             _logger.Info($"启动 MuMu 官方安装器：{installerPath}");             installer = Process.Start(new ProcessStartInfo             {                 FileName = installerPath,                 UseShellExecute = true             });         }         catch (Exception ex)         {             _logger.Error("启动 MuMu 安装器失败", ex);             return CreateMissingInstallStatus() with             {                 Label = "安装失败",                 Detail = $"无法打开 MuMu 安装器：{ex.Message}"             };         }          var deadline = DateTimeOffset.UtcNow.AddMinutes(20);         while (DateTimeOffset.UtcNow < deadline)         {             cancellationToken.ThrowIfCancellationRequested();             var installed = DiscoverInstallation();             if (installed is not null)             {                 _logger.Info($"MuMu 安装完成：{installed.TargetPath}");                 ReportProgress(new MuMuInstallProgress("安装完成", "MuMu 已安装，正在启动并连接。"));                 return await LaunchAndConnectAsync(cancellationToken);             }              var installerClosed = false;             if (installer is not null)             {                 try                 {                     installerClosed = installer.HasExited;                 }                 catch                 {                     installerClosed = false;                 }             }              if (installerClosed)             {                 await Task.Delay(TimeSpan.FromSeconds(3), cancellationToken);                 if (DiscoverInstallation() is null)                 {                     break;                 }             }              await Task.Delay(TimeSpan.FromSeconds(2), cancellationToken);         }          _logger.Warn("等待 MuMu 安装结束，但没有检测到安装目录。");         return CreateMissingInstallStatus() with         {             Label = "未完成安装",             Detail = "MuMu 安装尚未完成。安装窗口关闭后可以再次点击按钮继续。"         };     }      private async Task<string> DownloadInstallerAsync(CancellationToken cancellationToken)     {         var directory = Path.Combine(             Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),             "BlueArchiveLauncher",             "downloads");         Directory.CreateDirectory(directory);         var destination = Path.Combine(directory, "MuMu-setup.exe");         var temporary = destination + ".partial";          using var httpClient = new HttpClient { Timeout = TimeSpan.FromMinutes(10) };         using var response = await httpClient.GetAsync(             InstallerRedirectUrl,             HttpCompletionOption.ResponseHeadersRead,             cancellationToken);         response.EnsureSuccessStatusCode();          var total = response.Content.Headers.ContentLength;         await using var source = await response.Content.ReadAsStreamAsync(cancellationToken);         await using var target = new FileStream(             temporary,             FileMode.Create,             FileAccess.Write,             FileShare.None,             81920,             useAsync: true);          var buffer = new byte[81920];         long received = 0;         int read;         var nextReport = 0d;         while ((read = await source.ReadAsync(buffer, cancellationToken)) > 0)         {             await target.WriteAsync(buffer.AsMemory(0, read), cancellationToken);             received += read;             if (total is > 0)             {                 var percent = received * 100d / total.Value;                 if (percent >= nextReport)                 {                     ReportProgress(new MuMuInstallProgress(                         "下载中",                         $"正在下载 MuMu 官方安装器：{percent:0}%（{FormatBytes(received)} / {FormatBytes(total.Value)}）"));                     nextReport = percent + 5;                 }             }         }          if (File.Exists(destination))         {             File.Delete(destination);         }          File.Move(temporary, destination);         var size = new FileInfo(destination).Length;         if (size < 1024 * 1024)         {             throw new InvalidDataException($"安装器文件不完整（{FormatBytes(size)}）。");         }          _logger.Info($"MuMu 安装器已保存：{destination}，大小：{FormatBytes(size)}");         return destination;     }      private MuMuDiscovery? DiscoverInstallation()     {         var shortcut = DiscoverShortcut();         if (shortcut is not null)         {             return shortcut;         }          foreach (var root in GetInstalledRoots())         {             var mainPath = Path.Combine(root, "nx_main", "MuMuNxMain.exe");             if (!File.Exists(mainPath))             {                 continue;             }              var mainDirectory = Path.GetDirectoryName(mainPath) ?? root;             var discovery = new MuMuDiscovery(                 string.Empty,                 mainPath,                 string.Empty,                 mainDirectory,                 FindExecutable(mainDirectory, "adb.exe", Path.Combine("..", "nx_device", "12.0", "shell", "adb.exe")),                 FindExecutable(mainDirectory, "mumu-cli.exe", "MuMuManager.exe"),                 DefaultVmIndex);             _logger.Info($"通过安装目录找到 MuMu：{discovery.TargetPath}");             return discovery;         }          return null;     }      private IEnumerable<string> GetInstalledRoots()     {         var roots = new List<string>();         foreach (var view in new[] { RegistryView.Registry64, RegistryView.Registry32 })         {             try             {                 using var baseKey = RegistryKey.OpenBaseKey(RegistryHive.LocalMachine, view);                 using var uninstall = baseKey.OpenSubKey(@"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall");                 if (uninstall is null)                 {                     continue;                 }                  foreach (var name in uninstall.GetSubKeyNames())                 {                     using var key = uninstall.OpenSubKey(name);                     var displayName = key?.GetValue("DisplayName") as string;                     var location = key?.GetValue("InstallLocation") as string;                     if (string.IsNullOrWhiteSpace(displayName)                         || !displayName.Contains("MuMu", StringComparison.OrdinalIgnoreCase)                         || string.IsNullOrWhiteSpace(location))                     {                         continue;                     }                      roots.Add(Environment.ExpandEnvironmentVariables(location.Trim().Trim('"')));                 }             }             catch (Exception ex)             {                 _logger.Warn($"读取 MuMu 安装注册表失败：{ex.Message}");             }         }          roots.Add(Path.Combine(             Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles),             "Netease",             "MuMuPlayer-12.0"));         return roots             .Where(path => !string.IsNullOrWhiteSpace(path))             .Distinct(StringComparer.OrdinalIgnoreCase);     }      private async Task<MuMuStatus> ReadStatusAsync(         MuMuDiscovery discovery,         CancellationToken cancellationToken)     {         var instance = await ReadInstanceInfoAsync(discovery, cancellationToken);         if (instance is not null && (instance.IsProcessStarted || instance.IsAndroidStarted))         {             var adb = await ConnectAndCheckAdbAsync(                 discovery.AdbPath,                 instance.AdbHostIp,                 instance.AdbPort,                 cancellationToken);              if (adb.IsConnected)             {                 return new MuMuStatus(                     true,                     "已连接",                     $"已启动 MuMu 0 号实例，并通过 ADB 连接（{adb.Device}）。",                     discovery.ShortcutPath,                     discovery.AdbPath,                     true,                     true);             }              var state = instance.IsAndroidStarted ? "安卓实例已启动" : "安卓实例正在启动";             var endpoint = instance.AdbPort > 0                 ? $"ADB 地址：{instance.AdbHostIp}:{instance.AdbPort}。"                 : "暂未获取到 ADB 地址。";              return new MuMuStatus(                 false,                 "等待 ADB",                 $"{state}，{endpoint}正在尝试连接。",                 discovery.ShortcutPath,                 discovery.AdbPath,                 true,                 false);         }          if (IsMuMuMainRunning())         {             return new MuMuStatus(                 false,                 "窗口已打开",                 "MuMu 主程序已打开，但 0 号安卓实例尚未启动。",                 discovery.ShortcutPath,                 discovery.AdbPath,                 true,                 false);         }          var location = string.IsNullOrWhiteSpace(discovery.ShortcutPath)             ? Path.GetFileName(discovery.TargetPath)             : Path.GetFileName(discovery.ShortcutPath);         return new MuMuStatus(             false,             "已找到 MuMu",             $"已找到 MuMu：{location}。",             discovery.ShortcutPath,             discovery.AdbPath,             false,             false);     }      private async Task<MuMuInstanceInfo?> ReadInstanceInfoAsync(         MuMuDiscovery discovery,         CancellationToken cancellationToken)     {         if (string.IsNullOrWhiteSpace(discovery.CliPath))         {             return null;         }          var result = await RunProcessAsync(             discovery.CliPath,             new[] { "info", "--vmindex", discovery.VmIndex },             discovery.WorkingDirectory,             cancellationToken,             TimeSpan.FromSeconds(8));          if (result.ExitCode != 0 || string.IsNullOrWhiteSpace(result.StandardOutput))         {             return null;         }          try         {             using var document = JsonDocument.Parse(result.StandardOutput);             var root = document.RootElement;              if (root.ValueKind == JsonValueKind.Object                 && root.TryGetProperty(discovery.VmIndex, out var indexedInstance))             {                 root = indexedInstance;             }              return new MuMuInstanceInfo(                 GetBoolean(root, "is_process_started"),                 GetBoolean(root, "is_android_started"),                 GetString(root, "player_state"),                 GetString(root, "adb_host_ip") ?? "127.0.0.1",                 GetInt32(root, "adb_port"));         }         catch (JsonException ex)         {             _logger.Warn($"解析 MuMu 实例状态失败：{ex.Message}");             return null;         }     }      private async Task<(bool IsConnected, string? Device)> ConnectAndCheckAdbAsync(         string adbPath,         string host,         int port,         CancellationToken cancellationToken)     {         if (string.IsNullOrWhiteSpace(adbPath) || port <= 0)         {             return (false, null);         }          var endpoint = $"{host}:{port}";         var connectResult = await RunProcessAsync(             adbPath,             new[] { "connect", endpoint },             Path.GetDirectoryName(adbPath) ?? string.Empty,             cancellationToken,             TimeSpan.FromSeconds(5));          if (connectResult.ExitCode != 0)         {             _logger.Warn($"连接 MuMu ADB 失败（{endpoint}）：{TrimOutput(connectResult.CombinedOutput)}");             return (false, null);         }          var devicesResult = await RunProcessAsync(             adbPath,             new[] { "devices" },             Path.GetDirectoryName(adbPath) ?? string.Empty,             cancellationToken,             TimeSpan.FromSeconds(5));          var device = devicesResult.StandardOutput             .Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries)             .Select(line => line.Trim())             .Where(line => !line.StartsWith("List of devices", StringComparison.OrdinalIgnoreCase))             .Select(line => line.Split('\t', StringSplitOptions.RemoveEmptyEntries))             .Where(parts => parts.Length >= 2 && parts[1].Equals("device", StringComparison.OrdinalIgnoreCase))             .Select(parts => parts[0])             .FirstOrDefault();          return (device is not null, device);     }      private MuMuDiscovery? DiscoverShortcut()     {         foreach (var desktop in GetDesktopDirectories())         {             if (!Directory.Exists(desktop))             {                 continue;             }              IEnumerable<string> shortcuts;             try             {                 shortcuts = Directory.EnumerateFiles(desktop, "*.lnk", SearchOption.TopDirectoryOnly);             }             catch (Exception ex)             {                 _logger.Warn($"读取桌面快捷方式失败：{desktop}，{ex.Message}");                 continue;             }              foreach (var shortcutPath in shortcuts                          .OrderByDescending(path => IsLikelyMuMuShortcut(path))                          .ThenBy(path => path, StringComparer.OrdinalIgnoreCase))             {                 if (!IsLikelyMuMuShortcut(shortcutPath))                 {                     continue;                 }                  var discovery = ResolveShortcut(shortcutPath);                 if (discovery is not null)                 {                     _logger.Info(                         $"找到 MuMu 桌面快捷方式：{discovery.ShortcutPath}，目标：{discovery.TargetPath}，实例：{discovery.VmIndex}");                     return discovery;                 }             }         }          return null;     }      private MuMuDiscovery? ResolveShortcut(string shortcutPath)     {         object? shell = null;         object? shortcut = null;         try         {             var shellType = Type.GetTypeFromProgID("WScript.Shell");             if (shellType is null)             {                 _logger.Warn("当前系统无法创建 WScript.Shell，无法解析 MuMu 快捷方式。");                 return null;             }              shell = Activator.CreateInstance(shellType);             if (shell is null)             {                 return null;             }              dynamic shellObject = shell;             shortcut = shellObject.CreateShortcut(shortcutPath);             dynamic shortcutObject = shortcut;              var targetPath = Convert.ToString(shortcutObject.TargetPath) ?? string.Empty;             var arguments = Convert.ToString(shortcutObject.Arguments) ?? string.Empty;             var workingDirectory = Convert.ToString(shortcutObject.WorkingDirectory) ?? string.Empty;             if (string.IsNullOrWhiteSpace(targetPath))             {                 return null;             }              var targetDirectory = Path.GetDirectoryName(targetPath) ?? workingDirectory;             var adbPath = FindExecutable(                 targetDirectory,                 "adb.exe",                 Path.Combine("nx_device", "12.0", "shell", "adb.exe"));             var cliPath = FindExecutable(                 targetDirectory,                 "mumu-cli.exe",                 "MuMuManager.exe");              return new MuMuDiscovery(                 shortcutPath,                 targetPath,                 arguments,                 string.IsNullOrWhiteSpace(workingDirectory) ? targetDirectory : workingDirectory,                 adbPath,                 cliPath,                 DefaultVmIndex);         }         catch (Exception ex)         {             _logger.Warn($"解析快捷方式失败：{shortcutPath}，{ex.Message}");             return null;         }         finally         {             if (shortcut is not null && Marshal.IsComObject(shortcut))             {                 Marshal.FinalReleaseComObject(shortcut);             }              if (shell is not null && Marshal.IsComObject(shell))             {                 Marshal.FinalReleaseComObject(shell);             }         }     }      private static IEnumerable<string> GetDesktopDirectories()     {         var directories = new[]         {             Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory),             Environment.GetFolderPath(Environment.SpecialFolder.CommonDesktopDirectory)         };          return directories             .Where(path => !string.IsNullOrWhiteSpace(path))             .Distinct(StringComparer.OrdinalIgnoreCase);     }      private static bool IsLikelyMuMuShortcut(string shortcutPath)     {         var name = Path.GetFileNameWithoutExtension(shortcutPath);         return name.Contains("mumu", StringComparison.OrdinalIgnoreCase)             || name.Contains("模拟器", StringComparison.OrdinalIgnoreCase);     }      private static string FindExecutable(string targetDirectory, string fileName, params string[] relativePaths)     {         var candidates = new List<string>         {             Path.Combine(targetDirectory, fileName),             Path.Combine(Directory.GetParent(targetDirectory)?.FullName ?? targetDirectory, fileName)         };          candidates.AddRange(relativePaths.Select(path => Path.Combine(targetDirectory, path)));         return candidates.FirstOrDefault(File.Exists) ?? string.Empty;     }      private static bool IsMuMuMainRunning()     {         try         {             return Process.GetProcessesByName("MuMuNxMain").Any();         }         catch         {             return false;         }     }      private async Task<ProcessResult> RunProcessAsync(         string fileName,         IEnumerable<string> arguments,         string workingDirectory,         CancellationToken cancellationToken,         TimeSpan timeout)     {         using var process = new Process         {             StartInfo = new ProcessStartInfo             {                 FileName = fileName,                 WorkingDirectory = workingDirectory,                 UseShellExecute = false,                 CreateNoWindow = true,                 RedirectStandardOutput = true,                 RedirectStandardError = true             }         };          foreach (var argument in arguments)         {             process.StartInfo.ArgumentList.Add(argument);         }          try         {             if (!process.Start())             {                 return new ProcessResult(-1, string.Empty, "无法启动进程。");             }              var stdoutTask = process.StandardOutput.ReadToEndAsync();             var stderrTask = process.StandardError.ReadToEndAsync();             using var timeoutSource = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);             timeoutSource.CancelAfter(timeout);              try             {                 await process.WaitForExitAsync(timeoutSource.Token);             }             catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)             {                 try                 {                     process.Kill(entireProcessTree: true);                 }                 catch                 {                     // The short-lived helper may already have exited.                 }                  return new ProcessResult(-2, await stdoutTask, await stderrTask);             }              return new ProcessResult(                 process.ExitCode,                 await stdoutTask,                 await stderrTask);         }         catch (OperationCanceledException)         {             throw;         }         catch (Exception ex)         {             return new ProcessResult(-1, string.Empty, ex.Message);         }     }      private static MuMuStatus CreateMissingInstallStatus()     {         return new MuMuStatus(             false,             "未安装",             "没有找到 MuMu 模拟器。点击按钮后会下载官方安装器。",             string.Empty,             string.Empty);     }      private static string FormatBytes(long bytes)     {         if (bytes >= 1024 * 1024)         {             return $"{bytes / 1024d / 1024d:0.0} MB";         }          return $"{bytes / 1024d:0} KB";     }      private void ReportProgress(MuMuInstallProgress progress)     {         InstallProgressChanged?.Invoke(progress);     }      private static string? GetString(JsonElement element, string propertyName)     {         return element.TryGetProperty(propertyName, out var property)             && property.ValueKind == JsonValueKind.String             ? property.GetString()             : null;     }      private static bool GetBoolean(JsonElement element, string propertyName)     {         return element.TryGetProperty(propertyName, out var property)             && property.ValueKind == JsonValueKind.True;     }      private static int GetInt32(JsonElement element, string propertyName)     {         return element.TryGetProperty(propertyName, out var property)             && property.TryGetInt32(out var value)             ? value             : 0;     }      private static string TrimOutput(string output)     {         var value = output.Replace("\r", " ").Replace("\n", " ").Trim();         return value.Length <= 240 ? value : value[..240];     }      private sealed record MuMuDiscovery(         string ShortcutPath,         string TargetPath,         string Arguments,         string WorkingDirectory,         string AdbPath,         string CliPath,         string VmIndex);      private sealed record MuMuInstanceInfo(         bool IsProcessStarted,         bool IsAndroidStarted,         string? PlayerState,         string AdbHostIp,         int AdbPort);      private sealed record ProcessResult(         int ExitCode,         string StandardOutput,         string StandardError)     {         public string CombinedOutput =>             string.Join(                 Environment.NewLine,                 new[] { StandardOutput, StandardError }                     .Where(value => !string.IsNullOrWhiteSpace(value)));     } }  public sealed record MuMuInstallProgress(string Label, string Detail);  public sealed record MuMuStatus(     bool IsAvailable,     string Label,     string Detail,     string ShortcutPath = "",     string AdbPath = "",     bool IsRunning = false,     bool IsAdbConnected = false);
+using System.Diagnostics;
+using System.IO;
+using System.Net.Http;
+using Microsoft.Win32;
+using System.Runtime.InteropServices;
+using System.Text.Json;
+
+namespace BlueArchiveLauncher.Core.Services;
+
+public sealed class MuMuManager
+{
+    private const string DefaultVmIndex = "0";
+    private const string InstallerRedirectUrl = "https://api.mumuplayer.com/api/dl/win?channel=gw-win-download";
+
+    public event Action<MuMuInstallProgress>? InstallProgressChanged;
+
+    private readonly FileLogger _logger;
+
+    public MuMuManager(FileLogger logger)
+    {
+        _logger = logger;
+    }
+
+    public async Task<MuMuStatus> DetectAsync(CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+
+        var discovery = DiscoverInstallation();
+        if (discovery is null)
+        {
+            _logger.Warn("未找到已安装的 MuMu 模拟器。");
+            return CreateMissingInstallStatus();
+        }
+
+        return await ReadStatusAsync(discovery, cancellationToken);
+    }
+
+    public async Task<MuMuStatus> LaunchAndConnectAsync(CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+
+        var discovery = DiscoverInstallation();
+        if (discovery is null)
+        {
+            return await DownloadAndInstallAsync(cancellationToken);
+        }
+
+        var initialStatus = await ReadStatusAsync(discovery, cancellationToken);
+
+        if (!IsMuMuMainRunning())
+        {
+            try
+            {
+                var launchTarget = string.IsNullOrWhiteSpace(discovery.ShortcutPath)
+                    ? discovery.TargetPath
+                    : discovery.ShortcutPath;
+                _logger.Info($"启动 MuMu 主程序：{launchTarget}");
+                Process.Start(new ProcessStartInfo
+                {
+                    FileName = launchTarget,
+                    WorkingDirectory = discovery.WorkingDirectory,
+                    UseShellExecute = true
+                });
+            }
+            catch (Exception ex)
+            {
+                _logger.Error("启动 MuMu 桌面快捷方式失败", ex);
+                return initialStatus with
+                {
+                    Label = "启动失败",
+                    Detail = $"无法打开 MuMu 桌面快捷方式：{ex.Message}"
+                };
+            }
+
+            var mainDeadline = DateTimeOffset.UtcNow.AddSeconds(12);
+            while (!IsMuMuMainRunning() && DateTimeOffset.UtcNow < mainDeadline)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                await Task.Delay(TimeSpan.FromMilliseconds(500), cancellationToken);
+            }
+        }
+
+        if (string.IsNullOrWhiteSpace(discovery.CliPath))
+        {
+            _logger.Warn("已找到 MuMu 快捷方式，但没有找到 mumu-cli.exe。");
+            return (await ReadStatusAsync(discovery, cancellationToken)) with
+            {
+                Detail = "已打开 MuMu 主程序，但没有找到 MuMu 控制程序，无法自动启动 0 号实例。"
+            };
+        }
+
+        var launchResult = await RunProcessAsync(
+            discovery.CliPath,
+            new[] { "control", "--vmindex", discovery.VmIndex, "launch" },
+            discovery.WorkingDirectory,
+            cancellationToken,
+            TimeSpan.FromSeconds(12));
+
+        if (launchResult.ExitCode != 0)
+        {
+            _logger.Warn($"MuMu 实例启动命令失败：{launchResult.CombinedOutput}");
+            return (await ReadStatusAsync(discovery, cancellationToken)) with
+            {
+                Label = "启动失败",
+                Detail = $"MuMu 0 号实例启动失败：{TrimOutput(launchResult.CombinedOutput)}"
+            };
+        }
+
+        _logger.Info($"已请求 MuMu 启动实例 {discovery.VmIndex}：{TrimOutput(launchResult.CombinedOutput)}");
+
+        var deadline = DateTimeOffset.UtcNow.AddSeconds(45);
+        while (DateTimeOffset.UtcNow < deadline)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var status = await ReadStatusAsync(discovery, cancellationToken);
+            if (status.IsAdbConnected)
+            {
+                _logger.Info($"MuMu 实例已通过 ADB 连接：{status.Detail}");
+                return status;
+            }
+
+            await Task.Delay(TimeSpan.FromSeconds(1), cancellationToken);
+        }
+
+        var finalStatus = await ReadStatusAsync(discovery, cancellationToken);
+        _logger.Warn($"MuMu 实例启动后仍未建立 ADB 连接：{finalStatus.Detail}");
+        return finalStatus with
+        {
+            Detail = $"{finalStatus.Detail} 等待 ADB 连接超时，请确认 MuMu 窗口和 0 号实例已经完成启动。"
+        };
+    }
+
+private async Task<MuMuStatus> DownloadAndInstallAsync(CancellationToken cancellationToken)
+    {
+        _logger.Warn("未找到 MuMu，开始下载官方安装器。");
+        ReportProgress(new MuMuInstallProgress("下载中", "正在获取 MuMu 官方安装器..."));
+
+        string installerPath;
+        try
+        {
+            installerPath = await DownloadInstallerAsync(cancellationToken);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _logger.Error("下载 MuMu 安装器失败", ex);
+            return CreateMissingInstallStatus() with
+            {
+                Label = "下载失败",
+                Detail = $"MuMu 官方安装器下载失败：{ex.Message}"
+            };
+        }
+
+        ReportProgress(new MuMuInstallProgress(
+            "等待安装",
+            "安装器已下载。请在弹出的 MuMu 窗口中完成安装，完成后会自动连接。"));
+
+        Process? installer;
+        try
+        {
+            _logger.Info($"启动 MuMu 官方安装器：{installerPath}");
+            installer = Process.Start(new ProcessStartInfo
+            {
+                FileName = installerPath,
+                UseShellExecute = true
+            });
+        }
+        catch (Exception ex)
+        {
+            _logger.Error("启动 MuMu 安装器失败", ex);
+            return CreateMissingInstallStatus() with
+            {
+                Label = "安装失败",
+                Detail = $"无法打开 MuMu 安装器：{ex.Message}"
+            };
+        }
+
+        var deadline = DateTimeOffset.UtcNow.AddMinutes(20);
+        while (DateTimeOffset.UtcNow < deadline)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var installed = DiscoverInstallation();
+            if (installed is not null)
+            {
+                _logger.Info($"MuMu 安装完成：{installed.TargetPath}");
+                ReportProgress(new MuMuInstallProgress("安装完成", "MuMu 已安装，正在启动并连接。"));
+                return await LaunchAndConnectAsync(cancellationToken);
+            }
+
+            var installerClosed = false;
+            if (installer is not null)
+            {
+                try
+                {
+                    installerClosed = installer.HasExited;
+                }
+                catch
+                {
+                    installerClosed = false;
+                }
+            }
+
+            if (installerClosed)
+            {
+                await Task.Delay(TimeSpan.FromSeconds(3), cancellationToken);
+                if (DiscoverInstallation() is null)
+                {
+                    break;
+                }
+            }
+
+            await Task.Delay(TimeSpan.FromSeconds(2), cancellationToken);
+        }
+
+        _logger.Warn("等待 MuMu 安装结束，但没有检测到安装目录。");
+        return CreateMissingInstallStatus() with
+        {
+            Label = "未完成安装",
+            Detail = "MuMu 安装尚未完成。安装窗口关闭后可以再次点击按钮继续。"
+        };
+    }
+
+    private async Task<string> DownloadInstallerAsync(CancellationToken cancellationToken)
+    {
+        var directory = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "BlueArchiveLauncher",
+            "downloads");
+        Directory.CreateDirectory(directory);
+        var destination = Path.Combine(directory, "MuMu-setup.exe");
+        var temporary = destination + ".partial";
+
+        using var httpClient = new HttpClient { Timeout = TimeSpan.FromMinutes(10) };
+        using var response = await httpClient.GetAsync(
+            InstallerRedirectUrl,
+            HttpCompletionOption.ResponseHeadersRead,
+            cancellationToken);
+        response.EnsureSuccessStatusCode();
+
+        var total = response.Content.Headers.ContentLength;
+        await using var source = await response.Content.ReadAsStreamAsync(cancellationToken);
+        await using var target = new FileStream(
+            temporary,
+            FileMode.Create,
+            FileAccess.Write,
+            FileShare.None,
+            81920,
+            useAsync: true);
+
+        var buffer = new byte[81920];
+        long received = 0;
+        int read;
+        var nextReport = 0d;
+        while ((read = await source.ReadAsync(buffer, cancellationToken)) > 0)
+        {
+            await target.WriteAsync(buffer.AsMemory(0, read), cancellationToken);
+            received += read;
+            if (total is > 0)
+            {
+                var percent = received * 100d / total.Value;
+                if (percent >= nextReport)
+                {
+                    ReportProgress(new MuMuInstallProgress(
+                        "下载中",
+                        $"正在下载 MuMu 官方安装器：{percent:0}%（{FormatBytes(received)} / {FormatBytes(total.Value)}）"));
+                    nextReport = percent + 5;
+                }
+            }
+        }
+
+        if (File.Exists(destination))
+        {
+            File.Delete(destination);
+        }
+
+        File.Move(temporary, destination);
+        var size = new FileInfo(destination).Length;
+        if (size < 1024 * 1024)
+        {
+            throw new InvalidDataException($"安装器文件不完整（{FormatBytes(size)}）。");
+        }
+
+        _logger.Info($"MuMu 安装器已保存：{destination}，大小：{FormatBytes(size)}");
+        return destination;
+    }
+
+    private MuMuDiscovery? DiscoverInstallation()
+    {
+        var shortcut = DiscoverShortcut();
+        if (shortcut is not null)
+        {
+            return shortcut;
+        }
+
+        foreach (var root in GetInstalledRoots())
+        {
+            var mainPath = Path.Combine(root, "nx_main", "MuMuNxMain.exe");
+            if (!File.Exists(mainPath))
+            {
+                continue;
+            }
+
+            var mainDirectory = Path.GetDirectoryName(mainPath) ?? root;
+            var discovery = new MuMuDiscovery(
+                string.Empty,
+                mainPath,
+                string.Empty,
+                mainDirectory,
+                FindExecutable(mainDirectory, "adb.exe", Path.Combine("..", "nx_device", "12.0", "shell", "adb.exe")),
+                FindExecutable(mainDirectory, "mumu-cli.exe", "MuMuManager.exe"),
+                DefaultVmIndex);
+            _logger.Info($"通过安装目录找到 MuMu：{discovery.TargetPath}");
+            return discovery;
+        }
+
+        return null;
+    }
+
+    private IEnumerable<string> GetInstalledRoots()
+    {
+        var roots = new List<string>();
+        foreach (var view in new[] { RegistryView.Registry64, RegistryView.Registry32 })
+        {
+            try
+            {
+                using var baseKey = RegistryKey.OpenBaseKey(RegistryHive.LocalMachine, view);
+                using var uninstall = baseKey.OpenSubKey(@"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall");
+                if (uninstall is null)
+                {
+                    continue;
+                }
+
+                foreach (var name in uninstall.GetSubKeyNames())
+                {
+                    using var key = uninstall.OpenSubKey(name);
+                    var displayName = key?.GetValue("DisplayName") as string;
+                    var location = key?.GetValue("InstallLocation") as string;
+                    if (string.IsNullOrWhiteSpace(displayName)
+                        || !displayName.Contains("MuMu", StringComparison.OrdinalIgnoreCase)
+                        || string.IsNullOrWhiteSpace(location))
+                    {
+                        continue;
+                    }
+
+                    roots.Add(Environment.ExpandEnvironmentVariables(location.Trim().Trim('"')));
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.Warn($"读取 MuMu 安装注册表失败：{ex.Message}");
+            }
+        }
+
+        roots.Add(Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles),
+            "Netease",
+            "MuMuPlayer-12.0"));
+        return roots
+            .Where(path => !string.IsNullOrWhiteSpace(path))
+            .Distinct(StringComparer.OrdinalIgnoreCase);
+    }
+
+    private async Task<MuMuStatus> ReadStatusAsync(
+        MuMuDiscovery discovery,
+        CancellationToken cancellationToken)
+    {
+        var instance = await ReadInstanceInfoAsync(discovery, cancellationToken);
+        if (instance is not null && (instance.IsProcessStarted || instance.IsAndroidStarted))
+        {
+            var adb = await ConnectAndCheckAdbAsync(
+                discovery.AdbPath,
+                instance.AdbHostIp,
+                instance.AdbPort,
+                cancellationToken);
+
+            if (adb.IsConnected)
+            {
+                return new MuMuStatus(
+                    true,
+                    "已连接",
+                    $"已启动 MuMu 0 号实例，并通过 ADB 连接（{adb.Device}）。",
+                    discovery.ShortcutPath,
+                    discovery.AdbPath,
+                    true,
+                    true);
+            }
+
+            var state = instance.IsAndroidStarted ? "安卓实例已启动" : "安卓实例正在启动";
+            var endpoint = instance.AdbPort > 0
+                ? $"ADB 地址：{instance.AdbHostIp}:{instance.AdbPort}。"
+                : "暂未获取到 ADB 地址。";
+
+            return new MuMuStatus(
+                false,
+                "等待 ADB",
+                $"{state}，{endpoint}正在尝试连接。",
+                discovery.ShortcutPath,
+                discovery.AdbPath,
+                true,
+                false);
+        }
+
+        if (IsMuMuMainRunning())
+        {
+            return new MuMuStatus(
+                false,
+                "窗口已打开",
+                "MuMu 主程序已打开，但 0 号安卓实例尚未启动。",
+                discovery.ShortcutPath,
+                discovery.AdbPath,
+                true,
+                false);
+        }
+
+        var location = string.IsNullOrWhiteSpace(discovery.ShortcutPath)
+            ? Path.GetFileName(discovery.TargetPath)
+            : Path.GetFileName(discovery.ShortcutPath);
+        return new MuMuStatus(
+            false,
+            "已找到 MuMu",
+            $"已找到 MuMu：{location}。",
+            discovery.ShortcutPath,
+            discovery.AdbPath,
+            false,
+            false);
+    }
+
+    private async Task<MuMuInstanceInfo?> ReadInstanceInfoAsync(
+        MuMuDiscovery discovery,
+        CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(discovery.CliPath))
+        {
+            return null;
+        }
+
+        var result = await RunProcessAsync(
+            discovery.CliPath,
+            new[] { "info", "--vmindex", discovery.VmIndex },
+            discovery.WorkingDirectory,
+            cancellationToken,
+            TimeSpan.FromSeconds(8));
+
+        if (result.ExitCode != 0 || string.IsNullOrWhiteSpace(result.StandardOutput))
+        {
+            return null;
+        }
+
+        try
+        {
+            using var document = JsonDocument.Parse(result.StandardOutput);
+            var root = document.RootElement;
+
+            if (root.ValueKind == JsonValueKind.Object
+                && root.TryGetProperty(discovery.VmIndex, out var indexedInstance))
+            {
+                root = indexedInstance;
+            }
+
+            return new MuMuInstanceInfo(
+                GetBoolean(root, "is_process_started"),
+                GetBoolean(root, "is_android_started"),
+                GetString(root, "player_state"),
+                GetString(root, "adb_host_ip") ?? "127.0.0.1",
+                GetInt32(root, "adb_port"));
+        }
+        catch (JsonException ex)
+        {
+            _logger.Warn($"解析 MuMu 实例状态失败：{ex.Message}");
+            return null;
+        }
+    }
+
+    private async Task<(bool IsConnected, string? Device)> ConnectAndCheckAdbAsync(
+        string adbPath,
+        string host,
+        int port,
+        CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(adbPath) || port <= 0)
+        {
+            return (false, null);
+        }
+
+        var endpoint = $"{host}:{port}";
+        var connectResult = await RunProcessAsync(
+            adbPath,
+            new[] { "connect", endpoint },
+            Path.GetDirectoryName(adbPath) ?? string.Empty,
+            cancellationToken,
+            TimeSpan.FromSeconds(5));
+
+        if (connectResult.ExitCode != 0)
+        {
+            _logger.Warn($"连接 MuMu ADB 失败（{endpoint}）：{TrimOutput(connectResult.CombinedOutput)}");
+            return (false, null);
+        }
+
+        var devicesResult = await RunProcessAsync(
+            adbPath,
+            new[] { "devices" },
+            Path.GetDirectoryName(adbPath) ?? string.Empty,
+            cancellationToken,
+            TimeSpan.FromSeconds(5));
+
+        var device = devicesResult.StandardOutput
+            .Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries)
+            .Select(line => line.Trim())
+            .Where(line => !line.StartsWith("List of devices", StringComparison.OrdinalIgnoreCase))
+            .Select(line => line.Split('\t', StringSplitOptions.RemoveEmptyEntries))
+            .Where(parts => parts.Length >= 2 && parts[1].Equals("device", StringComparison.OrdinalIgnoreCase))
+            .Select(parts => parts[0])
+            .FirstOrDefault();
+
+        return (device is not null, device);
+    }
+
+    private MuMuDiscovery? DiscoverShortcut()
+    {
+        foreach (var desktop in GetDesktopDirectories())
+        {
+            if (!Directory.Exists(desktop))
+            {
+                continue;
+            }
+
+            IEnumerable<string> shortcuts;
+            try
+            {
+                shortcuts = Directory.EnumerateFiles(desktop, "*.lnk", SearchOption.TopDirectoryOnly);
+            }
+            catch (Exception ex)
+            {
+                _logger.Warn($"读取桌面快捷方式失败：{desktop}，{ex.Message}");
+                continue;
+            }
+
+            foreach (var shortcutPath in shortcuts
+                         .OrderByDescending(path => IsLikelyMuMuShortcut(path))
+                         .ThenBy(path => path, StringComparer.OrdinalIgnoreCase))
+            {
+                if (!IsLikelyMuMuShortcut(shortcutPath))
+                {
+                    continue;
+                }
+
+                var discovery = ResolveShortcut(shortcutPath);
+                if (discovery is not null)
+                {
+                    _logger.Info(
+                        $"找到 MuMu 桌面快捷方式：{discovery.ShortcutPath}，目标：{discovery.TargetPath}，实例：{discovery.VmIndex}");
+                    return discovery;
+                }
+            }
+        }
+
+        return null;
+    }
+
+    private MuMuDiscovery? ResolveShortcut(string shortcutPath)
+    {
+        object? shell = null;
+        object? shortcut = null;
+        try
+        {
+            var shellType = Type.GetTypeFromProgID("WScript.Shell");
+            if (shellType is null)
+            {
+                _logger.Warn("当前系统无法创建 WScript.Shell，无法解析 MuMu 快捷方式。");
+                return null;
+            }
+
+            shell = Activator.CreateInstance(shellType);
+            if (shell is null)
+            {
+                return null;
+            }
+
+            dynamic shellObject = shell;
+            shortcut = shellObject.CreateShortcut(shortcutPath);
+            dynamic shortcutObject = shortcut;
+
+            var targetPath = Convert.ToString(shortcutObject.TargetPath) ?? string.Empty;
+            var arguments = Convert.ToString(shortcutObject.Arguments) ?? string.Empty;
+            var workingDirectory = Convert.ToString(shortcutObject.WorkingDirectory) ?? string.Empty;
+            if (string.IsNullOrWhiteSpace(targetPath))
+            {
+                return null;
+            }
+
+            var targetDirectory = Path.GetDirectoryName(targetPath) ?? workingDirectory;
+            var adbPath = FindExecutable(
+                targetDirectory,
+                "adb.exe",
+                Path.Combine("nx_device", "12.0", "shell", "adb.exe"));
+            var cliPath = FindExecutable(
+                targetDirectory,
+                "mumu-cli.exe",
+                "MuMuManager.exe");
+
+            return new MuMuDiscovery(
+                shortcutPath,
+                targetPath,
+                arguments,
+                string.IsNullOrWhiteSpace(workingDirectory) ? targetDirectory : workingDirectory,
+                adbPath,
+                cliPath,
+                DefaultVmIndex);
+        }
+        catch (Exception ex)
+        {
+            _logger.Warn($"解析快捷方式失败：{shortcutPath}，{ex.Message}");
+            return null;
+        }
+        finally
+        {
+            if (shortcut is not null && Marshal.IsComObject(shortcut))
+            {
+                Marshal.FinalReleaseComObject(shortcut);
+            }
+
+            if (shell is not null && Marshal.IsComObject(shell))
+            {
+                Marshal.FinalReleaseComObject(shell);
+            }
+        }
+    }
+
+    private static IEnumerable<string> GetDesktopDirectories()
+    {
+        var directories = new[]
+        {
+            Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory),
+            Environment.GetFolderPath(Environment.SpecialFolder.CommonDesktopDirectory)
+        };
+
+        return directories
+            .Where(path => !string.IsNullOrWhiteSpace(path))
+            .Distinct(StringComparer.OrdinalIgnoreCase);
+    }
+
+    private static bool IsLikelyMuMuShortcut(string shortcutPath)
+    {
+        var name = Path.GetFileNameWithoutExtension(shortcutPath);
+        return name.Contains("mumu", StringComparison.OrdinalIgnoreCase)
+            || name.Contains("模拟器", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string FindExecutable(string targetDirectory, string fileName, params string[] relativePaths)
+    {
+        var candidates = new List<string>
+        {
+            Path.Combine(targetDirectory, fileName),
+            Path.Combine(Directory.GetParent(targetDirectory)?.FullName ?? targetDirectory, fileName)
+        };
+
+        candidates.AddRange(relativePaths.Select(path => Path.Combine(targetDirectory, path)));
+        return candidates.FirstOrDefault(File.Exists) ?? string.Empty;
+    }
+
+    private static bool IsMuMuMainRunning()
+    {
+        try
+        {
+            return Process.GetProcessesByName("MuMuNxMain").Any();
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private async Task<ProcessResult> RunProcessAsync(
+        string fileName,
+        IEnumerable<string> arguments,
+        string workingDirectory,
+        CancellationToken cancellationToken,
+        TimeSpan timeout)
+    {
+        using var process = new Process
+        {
+            StartInfo = new ProcessStartInfo
+            {
+                FileName = fileName,
+                WorkingDirectory = workingDirectory,
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true
+            }
+        };
+
+        foreach (var argument in arguments)
+        {
+            process.StartInfo.ArgumentList.Add(argument);
+        }
+
+        try
+        {
+            if (!process.Start())
+            {
+                return new ProcessResult(-1, string.Empty, "无法启动进程。");
+            }
+
+            var stdoutTask = process.StandardOutput.ReadToEndAsync();
+            var stderrTask = process.StandardError.ReadToEndAsync();
+            using var timeoutSource = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            timeoutSource.CancelAfter(timeout);
+
+            try
+            {
+                await process.WaitForExitAsync(timeoutSource.Token);
+            }
+            catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+            {
+                try
+                {
+                    process.Kill(entireProcessTree: true);
+                }
+                catch
+                {
+                    // The short-lived helper may already have exited.
+                }
+
+                return new ProcessResult(-2, await stdoutTask, await stderrTask);
+            }
+
+            return new ProcessResult(
+                process.ExitCode,
+                await stdoutTask,
+                await stderrTask);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            return new ProcessResult(-1, string.Empty, ex.Message);
+        }
+    }
+
+    private static MuMuStatus CreateMissingInstallStatus()
+    {
+        return new MuMuStatus(
+            false,
+            "未安装",
+            "没有找到 MuMu 模拟器。点击按钮后会下载官方安装器。",
+            string.Empty,
+            string.Empty);
+    }
+
+    private static string FormatBytes(long bytes)
+    {
+        if (bytes >= 1024 * 1024)
+        {
+            return $"{bytes / 1024d / 1024d:0.0} MB";
+        }
+
+        return $"{bytes / 1024d:0} KB";
+    }
+
+    private void ReportProgress(MuMuInstallProgress progress)
+    {
+        InstallProgressChanged?.Invoke(progress);
+    }
+
+    private static string? GetString(JsonElement element, string propertyName)
+    {
+        return element.TryGetProperty(propertyName, out var property)
+            && property.ValueKind == JsonValueKind.String
+            ? property.GetString()
+            : null;
+    }
+
+    private static bool GetBoolean(JsonElement element, string propertyName)
+    {
+        return element.TryGetProperty(propertyName, out var property)
+            && property.ValueKind == JsonValueKind.True;
+    }
+
+    private static int GetInt32(JsonElement element, string propertyName)
+    {
+        return element.TryGetProperty(propertyName, out var property)
+            && property.TryGetInt32(out var value)
+            ? value
+            : 0;
+    }
+
+    private static string TrimOutput(string output)
+    {
+        var value = output.Replace("\r", " ").Replace("\n", " ").Trim();
+        return value.Length <= 240 ? value : value[..240];
+    }
+
+    private sealed record MuMuDiscovery(
+        string ShortcutPath,
+        string TargetPath,
+        string Arguments,
+        string WorkingDirectory,
+        string AdbPath,
+        string CliPath,
+        string VmIndex);
+
+    private sealed record MuMuInstanceInfo(
+        bool IsProcessStarted,
+        bool IsAndroidStarted,
+        string? PlayerState,
+        string AdbHostIp,
+        int AdbPort);
+
+    private sealed record ProcessResult(
+        int ExitCode,
+        string StandardOutput,
+        string StandardError)
+    {
+        public string CombinedOutput =>
+            string.Join(
+                Environment.NewLine,
+                new[] { StandardOutput, StandardError }
+                    .Where(value => !string.IsNullOrWhiteSpace(value)));
+    }
+}
+
+public sealed record MuMuInstallProgress(string Label, string Detail);
+
+public sealed record MuMuStatus(
+    bool IsAvailable,
+    string Label,
+    string Detail,
+    string ShortcutPath = "",
+    string AdbPath = "",
+    bool IsRunning = false,
+    bool IsAdbConnected = false);
