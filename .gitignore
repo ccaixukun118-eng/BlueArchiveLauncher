@@ -1,0 +1,1 @@
+bin/ obj/ outputs/ work/ .codex/ .env *.user *.suo .vs/
