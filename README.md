@@ -1,6 +1,14 @@
-# 碧蓝档案启动器
+﻿# 碧蓝档案启动器
 
 一个面向《碧蓝档案》玩家的 Windows 桌面启动器。它把国际服、国服、日服的常用信息放在同一个界面里，用来查看卡池、总力战、活动和兑换码，并连接 MuMu 模拟器准备启动游戏。
+
+## 直接下载
+
+Windows 64 位用户可以直接下载已经打包好的程序：
+
+[下载 BlueArchiveLauncher.exe](https://github.com/ccaixukun118-eng/BlueArchiveLauncher/releases/download/v1.0.0/BlueArchiveLauncher.exe)
+
+下载后双击运行即可，不需要自己编译源码。也可以在页面右侧的 `Releases` 里打开 `碧蓝档案启动器 v1.0.0`，然后下载 `BlueArchiveLauncher.exe`。
 
 ## 能做什么
 
