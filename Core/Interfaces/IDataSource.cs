@@ -1,1 +1,10 @@
-using BlueArchiveLauncher.Core.Models;  namespace BlueArchiveLauncher.Core.Interfaces;  public interface IDataSource {     string Name { get; }      Task<DashboardSnapshot> GetDashboardAsync(ServerId serverId, CancellationToken cancellationToken); }
+using BlueArchiveLauncher.Core.Models;
+
+namespace BlueArchiveLauncher.Core.Interfaces;
+
+public interface IDataSource
+{
+    string Name { get; }
+
+    Task<DashboardSnapshot> GetDashboardAsync(ServerId serverId, CancellationToken cancellationToken);
+}
