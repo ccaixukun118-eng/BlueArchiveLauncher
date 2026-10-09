@@ -1,1 +1,11 @@
-using System.Windows;  namespace BlueArchiveLauncher;  public partial class MainWindow : Window {     public MainWindow()     {         InitializeComponent();     } }
+using System.Windows;
+
+namespace BlueArchiveLauncher;
+
+public partial class MainWindow : Window
+{
+    public MainWindow()
+    {
+        InitializeComponent();
+    }
+}
